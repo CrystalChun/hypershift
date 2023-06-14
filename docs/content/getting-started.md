@@ -15,21 +15,21 @@ you should adjust to your own environment.
 
 ## Prerequisites
 1. Install the HyperShift CLI (`hypershift`) using Go 1.19:
-        ```shell linenums="1"
-        git clone https://github.com/openshift/hypershift.git
-        cd hypershift
-        make build
-        sudo install -m 0755 bin/hypershift /usr/local/bin/hypershift
-        ```
+    ```shell linenums="1"
+    git clone https://github.com/openshift/hypershift.git
+    cd hypershift
+    make build
+    sudo install -m 0755 bin/hypershift /usr/local/bin/hypershift
+    ```
 2. Admin access to an OpenShift cluster (version 4.12+) specified by the `KUBECONFIG` environment variable.
 3. The OpenShift CLI (`oc`) or Kubernetes CLI (`kubectl`). 
 4. A valid [pull secret](https://cloud.redhat.com/openshift/install/aws/installer-provisioned) file for the `quay.io/openshift-release-dev` repository. 
 5. An [AWS credentials file](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html) with permissions to create infrastructure for the cluster. 
 6. A Route53 public zone for cluster DNS records. To create a public zone:
-        ```shell linenums="1"
-        BASE_DOMAIN=www.example.com
-        aws route53 create-hosted-zone --name $BASE_DOMAIN --caller-reference $(whoami)-$(date --rfc-3339=date)
-        ```
+    ```shell linenums="1"
+    BASE_DOMAIN=www.example.com
+    aws route53 create-hosted-zone --name $BASE_DOMAIN --caller-reference $(whoami)-$(date --rfc-3339=date)
+    ```
 
     !!! important
 
@@ -37,45 +37,45 @@ you should adjust to your own environment.
         this step. Otherwise, the public zone will affect the existing functions.
 
 7. An S3 bucket with public access to host OIDC discovery documents for your clusters. To create the bucket in *us-east-1*:
-        ```shell linenums="1"
-        BUCKET_NAME=your-bucket-name
-        aws s3api create-bucket --bucket $BUCKET_NAME
-        aws s3api delete-public-access-block --bucket $BUCKET_NAME
-        echo '{
-          "Version": "2012-10-17",
-          "Statement": [
+    ```shell linenums="1"
+    BUCKET_NAME=your-bucket-name
+    aws s3api create-bucket --bucket $BUCKET_NAME
+    aws s3api delete-public-access-block --bucket $BUCKET_NAME
+    echo '{
+        "Version": "2012-10-17",
+        "Statement": [
             {
               "Effect": "Allow",
               "Principal": "*",
               "Action": "s3:GetObject",
               "Resource": "arn:aws:s3:::${BUCKET_NAME}/*"
             }
-          ]
-        }' | envsubst > policy.json
-        aws s3api put-bucket-policy --bucket $BUCKET_NAME --policy file://policy.json
-        ```
+        ]
+    }' | envsubst > policy.json
+    aws s3api put-bucket-policy --bucket $BUCKET_NAME --policy file://policy.json
+    ```
 
     To create the bucket in a region other than us-east-1:
-        ```shell linenums="1"
-        BUCKET_NAME=your-bucket-name
-        REGION=us-east-2
-        aws s3api create-bucket --bucket $BUCKET_NAME \
-          --create-bucket-configuration LocationConstraint=$REGION \
-          --region $REGION
-        aws s3api delete-public-access-block --bucket $BUCKET_NAME
-        echo '{
-          "Version": "2012-10-17",
-          "Statement": [
+    ```shell linenums="1"
+    BUCKET_NAME=your-bucket-name
+    REGION=us-east-2
+    aws s3api create-bucket --bucket $BUCKET_NAME \
+        --create-bucket-configuration LocationConstraint=$REGION \
+        --region $REGION
+    aws s3api delete-public-access-block --bucket $BUCKET_NAME
+    echo '{
+        "Version": "2012-10-17",
+        "Statement": [
             {
               "Effect": "Allow",
               "Principal": "*",
               "Action": "s3:GetObject",
               "Resource": "arn:aws:s3:::${BUCKET_NAME}/*"
             }
-          ]
-        }' | envsubst > policy.json
-        aws s3api put-bucket-policy --bucket $BUCKET_NAME --policy file://policy.json
-        ```
+        ]
+    }' | envsubst > policy.json
+    aws s3api put-bucket-policy --bucket $BUCKET_NAME --policy file://policy.json
+    ```
 
 ## Install HyperShift Operator
 Install the HyperShift Operator into the management cluster, specifying the OIDC bucket, its region and credentials to access it (see [Prerequisites](#prerequisites)):
