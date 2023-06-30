@@ -33,19 +33,16 @@ import (
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/util/yaml"
-	"k8s.io/client-go/discovery"
 	"k8s.io/utils/pointer"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 
-	configapi "github.com/openshift/api/config/v1"
 	imageapi "github.com/openshift/api/image/v1"
 	hyperapi "github.com/openshift/hypershift/api"
 	hyperv1 "github.com/openshift/hypershift/api/v1beta1"
 	"github.com/openshift/hypershift/cmd/install/assets"
 	"github.com/openshift/hypershift/cmd/util"
 	"github.com/openshift/hypershift/cmd/version"
-	"github.com/openshift/hypershift/support/capabilities"
 	"github.com/openshift/hypershift/support/metrics"
 	"github.com/openshift/hypershift/support/rhobsmonitoring"
 )
@@ -371,11 +368,6 @@ func fetchImageRefs(file string) (map[string]string, error) {
 }
 
 func hyperShiftOperatorManifests(opts Options) ([]crclient.Object, error) {
-	mgmtClusterCaps, err := getMgmtClusterCapabilities()
-	if err != nil {
-		return nil, fmt.Errorf("unable to detect management cluster capabilities: %w", err)
-	}
-
 	var objects []crclient.Object
 
 	var images map[string]string
@@ -486,43 +478,6 @@ func hyperShiftOperatorManifests(opts Options) ([]crclient.Object, error) {
 			},
 		}
 		objects = append(objects, userCABundleCM)
-	}
-
-	if mgmtClusterCaps.Has(capabilities.CapabilityImage) && mgmtClusterCaps.Has(capabilities.CapabilityProxy) {
-		imageRegistryCABundle, err := getImageRegistryCABundle()
-		if err != nil {
-			return nil, err
-		}
-		if imageRegistryCABundle != "" {
-			// Create a new configmap containing all the image registry CA certificates as a bundle
-			// Proxy expects the configmap to:
-			// 1. contain only "ca-bundle.crt" as the key
-			// 2. exist in the openshift-config namespace
-			imageRegistryCABundle := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "user-image-registry-ca-bundle",
-					Namespace: "openshift-config",
-				},
-				Data: map[string]string{
-					"ca-bundle.crt": imageRegistryCABundle,
-				},
-			}
-			objects = append(objects, imageRegistryCABundle)
-
-			// Adding the configmap containing the bundle to the proxy object
-			// will allow the openshift-network-operator to automatically
-			// inject this bundle into the openshift-config-managed-trusted-ca-bundle configmap (created below)
-			// Reference: https://docs.openshift.com/container-platform/4.12/security/certificates/updating-ca-bundle.html
-			proxy := &configapi.Proxy{
-				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
-				Spec: configapi.ProxySpec{
-					TrustedCA: configapi.ConfigMapNameReference{
-						Name: imageRegistryCABundle.Name,
-					},
-				},
-			}
-			objects = append(objects, proxy)
-		}
 	}
 
 	trustedCABundle := &corev1.ConfigMap{
@@ -728,48 +683,4 @@ func hyperShiftOperatorManifests(opts Options) ([]crclient.Object, error) {
 	}
 
 	return objects, nil
-}
-
-// getMgmtClusterCapabilities initializes the ManagementClusterCabilities object
-// to determine if the management cluster has the listed capabilities
-func getMgmtClusterCapabilities() (*capabilities.ManagementClusterCapabilities, error) {
-	config, err := util.GetConfig()
-	if err != nil {
-		return nil, fmt.Errorf("unable to get kubernetes config: %w", err)
-	}
-	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get discovery client: %w", err)
-	}
-	return capabilities.DetectManagementClusterCapabilities(discoveryClient)
-}
-
-// getImageRegistryCABundle retrieves the image registry CAs listed under image.config.openshift.io
-// and merges them into one CA bundle
-func getImageRegistryCABundle() (string, error) {
-	client, err := util.GetClient()
-	if err != nil {
-		return "", err
-	}
-	img := &configapi.Image{}
-	if err := client.Get(context.Background(), types.NamespacedName{Name: "cluster"}, img); err != nil {
-		return "", err
-	}
-	if img != nil && img.Spec.AdditionalTrustedCA.Name != "" {
-		configmap := &corev1.ConfigMap{}
-		if err := client.Get(context.Background(), types.NamespacedName{Name: img.Spec.AdditionalTrustedCA.Name, Namespace: "openshift-config"}, configmap); err != nil {
-			return "", err
-		}
-		if configmap.Data != nil {
-			// Merge all registry CA certificates together into one bundle
-			var buf bytes.Buffer
-			for _, crt := range configmap.Data {
-				buf.WriteString(crt)
-			}
-			if buf.Len() > 0 {
-				return buf.String(), nil
-			}
-		}
-	}
-	return "", nil
 }

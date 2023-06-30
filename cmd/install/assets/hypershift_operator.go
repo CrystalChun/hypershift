@@ -496,6 +496,28 @@ func (o HyperShiftOperatorDeployment) Build() *appsv1.Deployment {
 					},
 					PriorityClassName:  HypershiftOperatorPriortyClass,
 					ServiceAccountName: o.ServiceAccount.Name,
+					InitContainers: []corev1.Container{
+						{
+							Name:            "init-environment",
+							Image:           image,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Command:         []string{"/usr/bin/hypershift-operator"},
+							Args:            []string{"init"},
+							// needed since hypershift operator runs with anyuuid scc
+							SecurityContext: &corev1.SecurityContext{
+								AllowPrivilegeEscalation: &allowPrivilegeEscalation,
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{
+										"ALL",
+									},
+								},
+								RunAsUser: k8sutilspointer.Int64(1000),
+								SeccompProfile: &corev1.SeccompProfile{
+									Type: corev1.SeccompProfileTypeRuntimeDefault,
+								},
+							},
+						},
+					},
 					Containers: []corev1.Container{
 						{
 							Name: HypershiftOperatorName,

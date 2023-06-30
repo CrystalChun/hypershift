@@ -15,22 +15,26 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"github.com/openshift/hypershift/support/globalconfig"
 	"os"
 	"strings"
 	"time"
+
+	"github.com/openshift/hypershift/support/globalconfig"
 
 	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/go-logr/logr"
+	configapi "github.com/openshift/api/config/v1"
 	operatorv1 "github.com/openshift/api/operator/v1"
 	hyperapi "github.com/openshift/hypershift/api"
 	hyperv1 "github.com/openshift/hypershift/api/v1beta1"
 	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
+	"github.com/openshift/hypershift/cmd/util"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/hostedcluster"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/nodepool"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/platform/aws"
@@ -59,6 +63,10 @@ import (
 )
 
 func main() {
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true), zap.JSONEncoder(func(o *zapcore.EncoderConfig) {
+		o.EncodeTime = zapcore.RFC3339TimeEncoder
+	})))
+
 	cmd := &cobra.Command{
 		Use: "hypershift-operator",
 		Run: func(cmd *cobra.Command, args []string) {
@@ -70,6 +78,7 @@ func main() {
 	cmd.Version = version.String()
 
 	cmd.AddCommand(NewStartCommand())
+	cmd.AddCommand(NewSetupCommand())
 
 	if err := cmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
@@ -95,10 +104,6 @@ type StartOptions struct {
 }
 
 func NewStartCommand() *cobra.Command {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true), zap.JSONEncoder(func(o *zapcore.EncoderConfig) {
-		o.EncodeTime = zapcore.RFC3339TimeEncoder
-	})))
-
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Runs the Hypershift operator",
@@ -187,6 +192,7 @@ func run(ctx context.Context, opts *StartOptions, log logr.Logger) error {
 	if err != nil {
 		return fmt.Errorf("unable to detect cluster capabilities: %w", err)
 	}
+	log.Info("mgmt cluster caps", "caps", mgmtClusterCaps, "specific capability", mgmtClusterCaps.Has(capabilities.CapabilityImage), "proxy", mgmtClusterCaps.Has(capabilities.CapabilityProxy))
 
 	lookupOperatorImage := func(userSpecifiedImage string) (string, error) {
 		if len(userSpecifiedImage) > 0 {
@@ -267,6 +273,7 @@ func run(ctx context.Context, opts *StartOptions, log logr.Logger) error {
 	// Populate registry overrides with any ICSP and IDMS from a OpenShift management cluster
 	var imageRegistryOverrides map[string][]string
 	if mgmtClusterCaps.Has(capabilities.CapabilityICSP) || mgmtClusterCaps.Has(capabilities.CapabilityIDMS) {
+		log.Info("mgmt cluster has icsp and idms")
 		// Warn the user this CR will be deprecated in the future
 		if mgmtClusterCaps.Has(capabilities.CapabilityICSP) {
 			log.Info("Detected ImageContentSourcePolicy Custom Resources. ImageContentSourcePolicy will be deprecated in favor of ImageDigestMirrorSet. See https://issues.redhat.com/browse/OCPNODE-1258 for more details.")
@@ -356,6 +363,7 @@ func run(ctx context.Context, opts *StartOptions, log logr.Logger) error {
 	}
 
 	if mgmtClusterCaps.Has(capabilities.CapabilityProxy) {
+		log.Info("mgmt cluster has proxy")
 		if err := proxy.Setup(mgr, opts.Namespace, opts.DeploymentName); err != nil {
 			return fmt.Errorf("failed to set up the proxy controller: %w", err)
 		}
@@ -433,4 +441,140 @@ func run(ctx context.Context, opts *StartOptions, log logr.Logger) error {
 	// Start the controllers
 	log.Info("starting manager")
 	return mgr.Start(ctx)
+}
+
+func NewSetupCommand() *cobra.Command {
+	ctrl.SetLogger(zap.New(zap.UseDevMode(true), zap.JSONEncoder(func(o *zapcore.EncoderConfig) {
+		o.EncodeTime = zapcore.RFC3339TimeEncoder
+	})))
+
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Initializes the environment for the Hypershift Operator",
+	}
+
+	cmd.Run = func(cmd *cobra.Command, args []string) {
+		ctx, cancel := context.WithCancel(ctrl.SetupSignalHandler())
+		defer cancel()
+
+		if err := runInit(ctx, ctrl.Log.WithName("init")); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+	}
+
+	return cmd
+}
+
+func runInit(ctx context.Context, log logr.Logger) error {
+	log.Info("Initializing environment for Hypershift Operator")
+	client, err := util.GetClient()
+	if err != nil {
+		return err
+	}
+	config := ctrl.GetConfigOrDie()
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return fmt.Errorf("unable to get discovery client: %w", err)
+	}
+	mgmtClusterCaps, err := capabilities.DetectManagementClusterCapabilities(discoveryClient)
+	if err != nil {
+		return fmt.Errorf("unable to detect management cluster capabilities: %w", err)
+	}
+
+	if mgmtClusterCaps.Has(capabilities.CapabilityImage) && mgmtClusterCaps.Has(capabilities.CapabilityProxy) {
+		imageRegistryCABundle, err := getImageRegistryCABundle(client)
+		if err != nil {
+			return err
+		}
+		if imageRegistryCABundle != "" {
+			// Create a new ConfigMap containing all the image registry CA certificates as a bundle
+			// Proxy expects the ConfigMap to:
+			// 1. contain only "ca-bundle.crt" as the key
+			// 2. exist in the openshift-config namespace
+			imageRegistryCABundleCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "user-image-registry-ca-bundle",
+					Namespace: "openshift-config",
+				},
+				Data: map[string]string{
+					"ca-bundle.crt": imageRegistryCABundle,
+				},
+			}
+			if err := apply(ctx, client, imageRegistryCABundleCM); err != nil {
+				return err
+			}
+
+			// Adding the ConfigMap containing the CA bundle to the Proxy object
+			// will allow the openshift-network-operator to automatically
+			// inject this bundle into the openshift-config-managed-trusted-ca-bundle ConfigMap (generated
+			// during hypershift install command)
+			// Reference: https://docs.openshift.com/container-platform/4.12/security/certificates/updating-ca-bundle.html
+			proxy := &configapi.Proxy{
+				ObjectMeta: metav1.ObjectMeta{Name: "cluster"},
+				Spec: configapi.ProxySpec{
+					TrustedCA: configapi.ConfigMapNameReference{
+						Name: imageRegistryCABundleCM.Name,
+					},
+				},
+			}
+			if err := apply(ctx, client, proxy); err != nil {
+				return err
+			}
+		}
+	}
+	log.Info("Finished initializing environment for Hypershift Operator")
+	return nil
+}
+
+func apply(ctx context.Context, client crclient.Client, object crclient.Object) error {
+	var objectBytes bytes.Buffer
+	if err := hyperapi.YamlSerializer.Encode(object, &objectBytes); err != nil {
+		return err
+	}
+	if err := client.Patch(ctx, object, crclient.RawPatch(types.ApplyPatchType, objectBytes.Bytes()), crclient.ForceOwnership, crclient.FieldOwner("hypershift")); err != nil {
+		return err
+	}
+	fmt.Printf("applied %s %s/%s\n", object.GetObjectKind().GroupVersionKind().Kind, object.GetNamespace(), object.GetName())
+	return nil
+}
+
+// getMgmtClusterCapabilities initializes the ManagementClusterCabilities object
+// to determine if the management cluster has the listed capabilities
+func getMgmtClusterCapabilities() (*capabilities.ManagementClusterCapabilities, error) {
+	config, err := util.GetConfig()
+	if err != nil {
+		return nil, fmt.Errorf("unable to get kubernetes config: %w", err)
+	}
+	discoveryClient, err := discovery.NewDiscoveryClientForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get discovery client: %w", err)
+	}
+	return capabilities.DetectManagementClusterCapabilities(discoveryClient)
+}
+
+// getImageRegistryCABundle retrieves the image registry CAs listed under image.config.openshift.io
+// and merges them into one CA bundle
+func getImageRegistryCABundle(client crclient.Client) (string, error) {
+	img := &configapi.Image{}
+	if err := client.Get(context.Background(), types.NamespacedName{Name: "cluster"}, img); err != nil {
+		return "", err
+	}
+	if img != nil && img.Spec.AdditionalTrustedCA.Name != "" {
+		configmap := &corev1.ConfigMap{}
+		if err := client.Get(context.Background(), types.NamespacedName{Name: img.Spec.AdditionalTrustedCA.Name, Namespace: "openshift-config"}, configmap); err != nil {
+			return "", err
+		}
+		if configmap.Data != nil {
+			// Merge all registry CA certificates together into one bundle
+			var buf bytes.Buffer
+			for _, crt := range configmap.Data {
+				buf.WriteString(crt)
+			}
+			if buf.Len() > 0 {
+				return buf.String(), nil
+			}
+		}
+	}
+	return "", nil
 }
